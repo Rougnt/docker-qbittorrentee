@@ -8,7 +8,7 @@ pipeline {
   }
   // Input to determine if this is a package check
   parameters {
-     string(defaultValue: 'false', description: 'package check run', name: 'PACKAGE_CHECK')
+    string(defaultValue: 'false', description: 'package check run', name: 'PACKAGE_CHECK')
   }
   // Configuration for the variables used for this specific repo
   environment {
@@ -59,11 +59,23 @@ pipeline {
       steps{
         echo "Running on node: ${NODE_NAME}"
         sh '''#! /bin/bash
-              containers=$(docker ps -aq)
+              echo "Pruning builder"
+              docker builder prune -f --builder container || :
+              containers=$(docker ps -q)
               if [[ -n "${containers}" ]]; then
-                docker stop ${containers}
+                BUILDX_CONTAINER_ID=$(docker ps -qf 'name=buildx_buildkit')
+                for container in ${containers}; do
+                  if [[ "${container}" == "${BUILDX_CONTAINER_ID}" ]]; then
+                    echo "skipping buildx container in docker stop"
+                  else
+                    echo "Stopping container ${container}"
+                    docker stop ${container}
+                  fi
+                done
               fi
-              docker system prune -af --volumes || : '''
+              docker system prune -f --volumes || :
+              docker image prune -af || :
+           '''
         script{
           env.EXIT_STATUS = ''
           env.LS_RELEASE = sh(
@@ -85,7 +97,11 @@ pipeline {
           env.DOCKERHUB_LINK = 'https://hub.docker.com/r/' + env.DOCKERHUB_IMAGE + '/tags/'
           env.PULL_REQUEST = env.CHANGE_ID
           env.TEMPLATED_FILES = 'Jenkinsfile README.md LICENSE .editorconfig ./.github/CONTRIBUTING.md ./.github/FUNDING.yml ./.github/ISSUE_TEMPLATE/config.yml ./.github/ISSUE_TEMPLATE/issue.bug.yml ./.github/ISSUE_TEMPLATE/issue.feature.yml ./.github/PULL_REQUEST_TEMPLATE.md ./.github/workflows/external_trigger_scheduler.yml ./.github/workflows/greetings.yml ./.github/workflows/package_trigger_scheduler.yml ./.github/workflows/call_issue_pr_tracker.yml ./.github/workflows/call_issues_cron.yml ./.github/workflows/permissions.yml ./.github/workflows/external_trigger.yml'
+          if ( env.SYFT_IMAGE_TAG == null ) {
+            env.SYFT_IMAGE_TAG = 'latest'
+          }
         }
+        echo "Using syft image tag ${SYFT_IMAGE_TAG}"
         sh '''#! /bin/bash
               echo "The default github branch detected as ${GH_DEFAULT_BRANCH}" '''
         script{
@@ -195,6 +211,8 @@ pipeline {
           env.VERSION_TAG = env.EXT_RELEASE_CLEAN + '-ls' + env.LS_TAG_NUMBER
           env.META_TAG = env.EXT_RELEASE_CLEAN + '-ls' + env.LS_TAG_NUMBER
           env.EXT_RELEASE_TAG = 'version-' + env.EXT_RELEASE_CLEAN
+          env.BUILDCACHE = 'docker.io/lsiodev/buildcache,registry.gitlab.com/linuxserver.io/docker-jenkins-builder/lsiodev-buildcache,ghcr.io/linuxserver/lsiodev-buildcache,quay.io/linuxserver.io/lsiodev-buildcache'
+          env.CITEST_IMAGETAG = 'latest'
         }
       }
     }
@@ -219,6 +237,8 @@ pipeline {
           env.META_TAG = env.EXT_RELEASE_CLEAN + '-pkg-' + env.PACKAGE_TAG + '-dev-' + env.COMMIT_SHA
           env.EXT_RELEASE_TAG = 'version-' + env.EXT_RELEASE_CLEAN
           env.DOCKERHUB_LINK = 'https://hub.docker.com/r/' + env.DEV_DOCKERHUB_IMAGE + '/tags/'
+          env.BUILDCACHE = 'docker.io/lsiodev/buildcache,registry.gitlab.com/linuxserver.io/docker-jenkins-builder/lsiodev-buildcache,ghcr.io/linuxserver/lsiodev-buildcache,quay.io/linuxserver.io/lsiodev-buildcache'
+          env.CITEST_IMAGETAG = 'develop'
         }
       }
     }
@@ -243,6 +263,8 @@ pipeline {
           env.EXT_RELEASE_TAG = 'version-' + env.EXT_RELEASE_CLEAN
           env.CODE_URL = 'https://github.com/' + env.LS_USER + '/' + env.LS_REPO + '/pull/' + env.PULL_REQUEST
           env.DOCKERHUB_LINK = 'https://hub.docker.com/r/' + env.PR_DOCKERHUB_IMAGE + '/tags/'
+          env.BUILDCACHE = 'docker.io/lsiodev/buildcache,registry.gitlab.com/linuxserver.io/docker-jenkins-builder/lsiodev-buildcache,ghcr.io/linuxserver/lsiodev-buildcache,quay.io/linuxserver.io/lsiodev-buildcache'
+          env.CITEST_IMAGETAG = 'develop'
         }
       }
     }
@@ -265,7 +287,7 @@ pipeline {
                   -v ${WORKSPACE}:/mnt \
                   -e AWS_ACCESS_KEY_ID=\"${S3_KEY}\" \
                   -e AWS_SECRET_ACCESS_KEY=\"${S3_SECRET}\" \
-                  ghcr.io/linuxserver/baseimage-alpine:3.20 s6-envdir -fn -- /var/run/s6/container_environment /bin/bash -c "\
+                  ghcr.io/linuxserver/baseimage-alpine:3.23 s6-envdir -fn -- /var/run/s6/container_environment /bin/bash -c "\
                     apk add --no-cache python3 && \
                     python3 -m venv /lsiopy && \
                     pip install --no-cache-dir -U pip && \
@@ -338,6 +360,35 @@ pipeline {
                 exit 0
               else
                 echo "No templates to delete"
+              fi
+              echo "Starting Stage 2.5 - Update init diagram"
+              if ! grep -q 'init_diagram:' readme-vars.yml; then
+                echo "Adding the key 'init_diagram' to readme-vars.yml"
+                sed -i '\\|^#.*changelog.*$|d' readme-vars.yml
+                sed -i 's|^changelogs:|# init diagram\\ninit_diagram:\\n\\n# changelog\\nchangelogs:|' readme-vars.yml
+              fi
+              mkdir -p ${TEMPDIR}/d2
+              docker run --rm -v ${TEMPDIR}/d2:/output -e PUID=$(id -u) -e PGID=$(id -g) -e RAW="true" ghcr.io/linuxserver/d2-builder:latest ${CONTAINER_NAME}:latest
+              ls -al ${TEMPDIR}/d2
+              yq -ei ".init_diagram |= load_str(\\"${TEMPDIR}/d2/${CONTAINER_NAME}-latest.d2\\")" readme-vars.yml
+              if [[ $(md5sum readme-vars.yml | cut -c1-8) != $(md5sum ${TEMPDIR}/docker-${CONTAINER_NAME}/readme-vars.yml | cut -c1-8) ]]; then
+                echo "'init_diagram' has been updated. Updating repo and exiting build, new one will trigger based on commit."
+                mkdir -p ${TEMPDIR}/repo
+                git clone https://github.com/${LS_USER}/${LS_REPO}.git ${TEMPDIR}/repo/${LS_REPO}
+                cd ${TEMPDIR}/repo/${LS_REPO}
+                git checkout -f master
+                cp ${WORKSPACE}/readme-vars.yml ${TEMPDIR}/repo/${LS_REPO}/readme-vars.yml
+                git add readme-vars.yml
+                git commit -m 'Bot Updating Templated Files'
+                git pull https://LinuxServer-CI:${GITHUB_TOKEN}@github.com/${LS_USER}/${LS_REPO}.git master
+                git push https://LinuxServer-CI:${GITHUB_TOKEN}@github.com/${LS_USER}/${LS_REPO}.git master
+                echo "true" > /tmp/${COMMIT_SHA}-${BUILD_NUMBER}
+                echo "Updating templates and exiting build, new one will trigger based on commit"
+                rm -Rf ${TEMPDIR}
+                exit 0
+              else
+                echo "false" > /tmp/${COMMIT_SHA}-${BUILD_NUMBER}
+                echo "Init diagram is unchanged"
               fi
               echo "Starting Stage 3 - Update templates"
               CURRENTHASH=$(grep -hs ^ ${TEMPLATED_FILES} | md5sum | cut -c1-8)
@@ -547,8 +598,45 @@ pipeline {
           --label \"org.opencontainers.image.title=Qbittorrent\" \
           --label \"org.opencontainers.image.description=The [Qbittorrent](https://www.qbittorrent.org/) project aims to provide an open-source software alternative to µTorrent. qBittorrent is based on the Qt toolkit and libtorrent-rasterbar library.\" \
           --no-cache --pull -t ${IMAGE}:${META_TAG} --platform=linux/amd64 \
-          --provenance=false --sbom=false \
+          --provenance=true --sbom=true --builder=container --load \
           --build-arg ${BUILD_VERSION_ARG}=${EXT_RELEASE} --build-arg VERSION=\"${VERSION_TAG}\" --build-arg BUILD_DATE=${GITHUB_DATE} ."
+        sh '''#! /bin/bash
+              set -e
+              IFS=',' read -ra CACHE <<< "$BUILDCACHE"
+              for i in "${CACHE[@]}"; do
+                docker tag ${IMAGE}:${META_TAG} ${i}:amd64-${COMMIT_SHA}-${BUILD_NUMBER}
+              done
+           '''
+        withCredentials([
+          [
+            $class: 'UsernamePasswordMultiBinding',
+            credentialsId: 'Quay.io-Robot',
+            usernameVariable: 'QUAYUSER',
+            passwordVariable: 'QUAYPASS'
+          ]
+        ]) {
+          retry_backoff(5,5) {
+              sh '''#! /bin/bash
+                    set -e
+                    echo $DOCKERHUB_TOKEN | docker login -u linuxserverci --password-stdin
+                    echo $GITHUB_TOKEN | docker login ghcr.io -u LinuxServer-CI --password-stdin
+                    echo $GITLAB_TOKEN | docker login registry.gitlab.com -u LinuxServer.io --password-stdin
+                    echo $QUAYPASS | docker login quay.io -u $QUAYUSER --password-stdin
+
+                    if [[ "${PACKAGE_CHECK}" != "true" ]]; then
+                      declare -A pids
+                      IFS=',' read -ra CACHE <<< "$BUILDCACHE"
+                      for i in "${CACHE[@]}"; do
+                        docker push ${i}:amd64-${COMMIT_SHA}-${BUILD_NUMBER} &
+                        pids[$!]="$i"
+                      done
+                      for p in "${!pids[@]}"; do
+                        wait "$p" || { [[ "${pids[$p]}" != *"quay.io"* ]] && exit 1; }
+                      done
+                    fi
+                '''
+          }
+        }
       }
     }
     // Build MultiArch Docker containers for push to LS Repo
@@ -579,8 +667,45 @@ pipeline {
               --label \"org.opencontainers.image.title=Qbittorrent\" \
               --label \"org.opencontainers.image.description=The [Qbittorrent](https://www.qbittorrent.org/) project aims to provide an open-source software alternative to µTorrent. qBittorrent is based on the Qt toolkit and libtorrent-rasterbar library.\" \
               --no-cache --pull -t ${IMAGE}:amd64-${META_TAG} --platform=linux/amd64 \
-              --provenance=false --sbom=false \
+              --provenance=true --sbom=true --builder=container --load \
               --build-arg ${BUILD_VERSION_ARG}=${EXT_RELEASE} --build-arg VERSION=\"${VERSION_TAG}\" --build-arg BUILD_DATE=${GITHUB_DATE} ."
+            sh '''#! /bin/bash
+                  set -e
+                  IFS=',' read -ra CACHE <<< "$BUILDCACHE"
+                  for i in "${CACHE[@]}"; do
+                    docker tag ${IMAGE}:amd64-${META_TAG} ${i}:amd64-${COMMIT_SHA}-${BUILD_NUMBER}
+                  done
+               '''
+            withCredentials([
+              [
+                $class: 'UsernamePasswordMultiBinding',
+                credentialsId: 'Quay.io-Robot',
+                usernameVariable: 'QUAYUSER',
+                passwordVariable: 'QUAYPASS'
+              ]
+            ]) {
+              retry_backoff(5,5) {
+                  sh '''#! /bin/bash
+                        set -e
+                        echo $DOCKERHUB_TOKEN | docker login -u linuxserverci --password-stdin
+                        echo $GITHUB_TOKEN | docker login ghcr.io -u LinuxServer-CI --password-stdin
+                        echo $GITLAB_TOKEN | docker login registry.gitlab.com -u LinuxServer.io --password-stdin
+                        echo $QUAYPASS | docker login quay.io -u $QUAYUSER --password-stdin
+
+                        if [[ "${PACKAGE_CHECK}" != "true" ]]; then
+                          declare -A pids
+                          IFS=',' read -ra CACHE <<< "$BUILDCACHE"
+                          for i in "${CACHE[@]}"; do
+                            docker push ${i}:amd64-${COMMIT_SHA}-${BUILD_NUMBER} &
+                            pids[$!]="$i"
+                          done
+                          for p in "${!pids[@]}"; do
+                            wait "$p" || { [[ "${pids[$p]}" != *"quay.io"* ]] && exit 1; }
+                          done
+                        fi
+                    '''
+              }
+            }
           }
         }
         stage('Build ARM64') {
@@ -589,10 +714,6 @@ pipeline {
           }
           steps {
             echo "Running on node: ${NODE_NAME}"
-            echo 'Logging into Github'
-            sh '''#! /bin/bash
-                  echo $GITHUB_TOKEN | docker login ghcr.io -u LinuxServer-CI --password-stdin
-               '''
             sh "sed -r -i 's|(^FROM .*)|\\1\\n\\nENV LSIO_FIRST_PARTY=true|g' Dockerfile.aarch64"
             sh "docker buildx build \
               --label \"org.opencontainers.image.created=${GITHUB_DATE}\" \
@@ -608,18 +729,52 @@ pipeline {
               --label \"org.opencontainers.image.title=Qbittorrent\" \
               --label \"org.opencontainers.image.description=The [Qbittorrent](https://www.qbittorrent.org/) project aims to provide an open-source software alternative to µTorrent. qBittorrent is based on the Qt toolkit and libtorrent-rasterbar library.\" \
               --no-cache --pull -f Dockerfile.aarch64 -t ${IMAGE}:arm64v8-${META_TAG} --platform=linux/arm64 \
-              --provenance=false --sbom=false \
+              --provenance=true --sbom=true --builder=container --load \
               --build-arg ${BUILD_VERSION_ARG}=${EXT_RELEASE} --build-arg VERSION=\"${VERSION_TAG}\" --build-arg BUILD_DATE=${GITHUB_DATE} ."
-            sh "docker tag ${IMAGE}:arm64v8-${META_TAG} ghcr.io/linuxserver/lsiodev-buildcache:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER}"
-            retry_backoff(5,5) {
-              sh "docker push ghcr.io/linuxserver/lsiodev-buildcache:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER}"
+            sh '''#! /bin/bash
+                  set -e
+                  IFS=',' read -ra CACHE <<< "$BUILDCACHE"
+                  for i in "${CACHE[@]}"; do
+                    docker tag ${IMAGE}:arm64v8-${META_TAG} ${i}:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER}
+                  done
+               '''
+            withCredentials([
+              [
+                $class: 'UsernamePasswordMultiBinding',
+                credentialsId: 'Quay.io-Robot',
+                usernameVariable: 'QUAYUSER',
+                passwordVariable: 'QUAYPASS'
+              ]
+            ]) {
+              retry_backoff(5,5) {
+                  sh '''#! /bin/bash
+                        set -e
+                        echo $DOCKERHUB_TOKEN | docker login -u linuxserverci --password-stdin
+                        echo $GITHUB_TOKEN | docker login ghcr.io -u LinuxServer-CI --password-stdin
+                        echo $GITLAB_TOKEN | docker login registry.gitlab.com -u LinuxServer.io --password-stdin
+                        echo $QUAYPASS | docker login quay.io -u $QUAYUSER --password-stdin
+                        if [[ "${PACKAGE_CHECK}" != "true" ]]; then
+                          declare -A pids
+                          IFS=',' read -ra CACHE <<< "$BUILDCACHE"
+                          for i in "${CACHE[@]}"; do
+                            docker push ${i}:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER} &
+                            pids[$!]="$i"
+                          done
+                          for p in "${!pids[@]}"; do
+                            wait "$p" || { [[ "${pids[$p]}" != *"quay.io"* ]] && exit 1; }
+                          done
+                        fi
+                    '''
+              }
             }
             sh '''#! /bin/bash
                   containers=$(docker ps -aq)
                   if [[ -n "${containers}" ]]; then
                     docker stop ${containers}
                   fi
-                  docker system prune -af --volumes || : '''
+                  docker system prune -f --volumes || :
+                  docker image prune -af || :
+               '''
           }
         }
       }
@@ -644,7 +799,7 @@ pipeline {
               docker run --rm \
                 -v /var/run/docker.sock:/var/run/docker.sock:ro \
                 -v ${TEMPDIR}:/tmp \
-                ghcr.io/anchore/syft:latest \
+                ghcr.io/anchore/syft:${SYFT_IMAGE_TAG} \
                 ${LOCAL_CONTAINER} -o table=/tmp/package_versions.txt
               NEW_PACKAGE_TAG=$(md5sum ${TEMPDIR}/package_versions.txt | cut -c1-8 )
               echo "Package tag sha from current packages in buit container is ${NEW_PACKAGE_TAG} comparing to old ${PACKAGE_TAG} from github"
@@ -731,7 +886,7 @@ pipeline {
                     CI_DOCKERENV="LSIO_FIRST_PARTY=true"
                   fi
                 fi
-                docker pull ghcr.io/linuxserver/ci:latest
+                docker pull ghcr.io/linuxserver/ci:${CITEST_IMAGETAG}
                 if [ "${MULTIARCH}" == "true" ]; then
                   docker pull ghcr.io/linuxserver/lsiodev-buildcache:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER} --platform=arm64
                   docker tag ghcr.io/linuxserver/lsiodev-buildcache:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER} ${IMAGE}:arm64v8-${META_TAG}
@@ -754,7 +909,10 @@ pipeline {
                 -e WEB_AUTH=\"${CI_AUTH}\" \
                 -e WEB_PATH=\"${CI_WEBPATH}\" \
                 -e NODE_NAME=\"${NODE_NAME}\" \
-                -t ghcr.io/linuxserver/ci:latest \
+                -e SYFT_IMAGE_TAG=\"${CI_SYFT_IMAGE_TAG:-${SYFT_IMAGE_TAG}}\" \
+                -e COMMIT_SHA=\"${COMMIT_SHA}\" \
+                -e BUILD_NUMBER=\"${BUILD_NUMBER}\" \
+                -t ghcr.io/linuxserver/ci:${CITEST_IMAGETAG} \
                 python3 test_build.py'''
         }
       }
@@ -769,37 +927,25 @@ pipeline {
         environment name: 'EXIT_STATUS', value: ''
       }
       steps {
-        withCredentials([
-          [
-            $class: 'UsernamePasswordMultiBinding',
-            credentialsId: 'Quay.io-Robot',
-            usernameVariable: 'QUAYUSER',
-            passwordVariable: 'QUAYPASS'
-          ]
-        ]) {
-          retry_backoff(5,5) {
-            sh '''#! /bin/bash
-                  set -e
-                  echo $DOCKERHUB_TOKEN | docker login -u linuxserverci --password-stdin
-                  echo $GITHUB_TOKEN | docker login ghcr.io -u LinuxServer-CI --password-stdin
-                  echo $GITLAB_TOKEN | docker login registry.gitlab.com -u LinuxServer.io --password-stdin
-                  echo $QUAYPASS | docker login quay.io -u $QUAYUSER --password-stdin
-                  for PUSHIMAGE in "${GITHUBIMAGE}" "${GITLABIMAGE}" "${QUAYIMAGE}" "${IMAGE}"; do
-                    docker tag ${IMAGE}:${META_TAG} ${PUSHIMAGE}:${META_TAG}
-                    docker tag ${PUSHIMAGE}:${META_TAG} ${PUSHIMAGE}:latest
-                    docker tag ${PUSHIMAGE}:${META_TAG} ${PUSHIMAGE}:${EXT_RELEASE_TAG}
-                    if [ -n "${SEMVER}" ]; then
-                      docker tag ${PUSHIMAGE}:${META_TAG} ${PUSHIMAGE}:${SEMVER}
-                    fi
-                    docker push ${PUSHIMAGE}:latest
-                    docker push ${PUSHIMAGE}:${META_TAG}
-                    docker push ${PUSHIMAGE}:${EXT_RELEASE_TAG}
-                    if [ -n "${SEMVER}" ]; then
-                      docker push ${PUSHIMAGE}:${SEMVER}
-                    fi
+        retry_backoff(5,5) {
+          sh '''#! /bin/bash
+                set -e
+                for PUSHIMAGE in "${IMAGE}" "${GITLABIMAGE}" "${GITHUBIMAGE}" "${QUAYIMAGE}"; do
+                  [[ ${PUSHIMAGE%%/*} =~ \\. ]] && PUSHIMAGEPLUS="${PUSHIMAGE}" || PUSHIMAGEPLUS="docker.io/${PUSHIMAGE}"
+                  IFS=',' read -ra CACHE <<< "$BUILDCACHE"
+                  for i in "${CACHE[@]}"; do
+                      if [[ "${PUSHIMAGEPLUS}" == "$(cut -d "/" -f1 <<< ${i})"* ]]; then
+                          CACHEIMAGE=${i}
+                      fi
                   done
-               '''
-          }
+                  docker buildx imagetools create --prefer-index=false -t ${PUSHIMAGE}:${META_TAG} -t ${PUSHIMAGE}:latest -t ${PUSHIMAGE}:${EXT_RELEASE_TAG} ${CACHEIMAGE}:amd64-${COMMIT_SHA}-${BUILD_NUMBER} || \
+                    { if [[ "${PUSHIMAGE}" != "${QUAYIMAGE}" ]]; then exit 1; fi; }
+                  if [ -n "${SEMVER}" ]; then
+                    docker buildx imagetools create --prefer-index=false -t ${PUSHIMAGE}:${SEMVER} ${CACHEIMAGE}:amd64-${COMMIT_SHA}-${BUILD_NUMBER} || \
+                      { if [[ "${PUSHIMAGE}" != "${QUAYIMAGE}" ]]; then exit 1; fi; }
+                  fi
+                done
+              '''
         }
       }
     }
@@ -810,57 +956,41 @@ pipeline {
         environment name: 'EXIT_STATUS', value: ''
       }
       steps {
-        withCredentials([
-          [
-            $class: 'UsernamePasswordMultiBinding',
-            credentialsId: 'Quay.io-Robot',
-            usernameVariable: 'QUAYUSER',
-            passwordVariable: 'QUAYPASS'
-          ]
-        ]) {
-          retry_backoff(5,5) {
-            sh '''#! /bin/bash
-                  set -e
-                  echo $DOCKERHUB_TOKEN | docker login -u linuxserverci --password-stdin
-                  echo $GITHUB_TOKEN | docker login ghcr.io -u LinuxServer-CI --password-stdin
-                  echo $GITLAB_TOKEN | docker login registry.gitlab.com -u LinuxServer.io --password-stdin
-                  echo $QUAYPASS | docker login quay.io -u $QUAYUSER --password-stdin
-                  if [ "${CI}" == "false" ]; then
-                    docker pull ghcr.io/linuxserver/lsiodev-buildcache:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER} --platform=arm64
-                    docker tag ghcr.io/linuxserver/lsiodev-buildcache:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER} ${IMAGE}:arm64v8-${META_TAG}
+        retry_backoff(5,5) {
+          sh '''#! /bin/bash
+                set -e
+                for MANIFESTIMAGE in "${IMAGE}" "${GITLABIMAGE}" "${GITHUBIMAGE}" "${QUAYIMAGE}"; do
+                  [[ ${MANIFESTIMAGE%%/*} =~ \\. ]] && MANIFESTIMAGEPLUS="${MANIFESTIMAGE}" || MANIFESTIMAGEPLUS="docker.io/${MANIFESTIMAGE}"
+                  IFS=',' read -ra CACHE <<< "$BUILDCACHE"
+                  for i in "${CACHE[@]}"; do
+                      if [[ "${MANIFESTIMAGEPLUS}" == "$(cut -d "/" -f1 <<< ${i})"* ]]; then
+                          CACHEIMAGE=${i}
+                      fi
+                  done
+                  docker buildx imagetools create --prefer-index=false -t ${MANIFESTIMAGE}:amd64-${META_TAG} -t ${MANIFESTIMAGE}:amd64-latest -t ${MANIFESTIMAGE}:amd64-${EXT_RELEASE_TAG} ${CACHEIMAGE}:amd64-${COMMIT_SHA}-${BUILD_NUMBER} || \
+                    { if [[ "${MANIFESTIMAGE}" != "${QUAYIMAGE}" ]]; then exit 1; fi; }
+                  docker buildx imagetools create --prefer-index=false -t ${MANIFESTIMAGE}:arm64v8-${META_TAG} -t ${MANIFESTIMAGE}:arm64v8-latest -t ${MANIFESTIMAGE}:arm64v8-${EXT_RELEASE_TAG} ${CACHEIMAGE}:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER} || \
+                    { if [[ "${MANIFESTIMAGE}" != "${QUAYIMAGE}" ]]; then exit 1; fi; }
+                  if [ -n "${SEMVER}" ]; then
+                    docker buildx imagetools create --prefer-index=false -t ${MANIFESTIMAGE}:amd64-${SEMVER} ${CACHEIMAGE}:amd64-${COMMIT_SHA}-${BUILD_NUMBER} || \
+                      { if [[ "${MANIFESTIMAGE}" != "${QUAYIMAGE}" ]]; then exit 1; fi; }
+                    docker buildx imagetools create --prefer-index=false -t ${MANIFESTIMAGE}:arm64v8-${SEMVER} ${CACHEIMAGE}:arm64v8-${COMMIT_SHA}-${BUILD_NUMBER} || \
+                      { if [[ "${MANIFESTIMAGE}" != "${QUAYIMAGE}" ]]; then exit 1; fi; }
                   fi
-                  for MANIFESTIMAGE in "${IMAGE}" "${GITLABIMAGE}" "${GITHUBIMAGE}" "${QUAYIMAGE}"; do
-                    docker tag ${IMAGE}:amd64-${META_TAG} ${MANIFESTIMAGE}:amd64-${META_TAG}
-                    docker tag ${MANIFESTIMAGE}:amd64-${META_TAG} ${MANIFESTIMAGE}:amd64-latest
-                    docker tag ${MANIFESTIMAGE}:amd64-${META_TAG} ${MANIFESTIMAGE}:amd64-${EXT_RELEASE_TAG}
-                    docker tag ${IMAGE}:arm64v8-${META_TAG} ${MANIFESTIMAGE}:arm64v8-${META_TAG}
-                    docker tag ${MANIFESTIMAGE}:arm64v8-${META_TAG} ${MANIFESTIMAGE}:arm64v8-latest
-                    docker tag ${MANIFESTIMAGE}:arm64v8-${META_TAG} ${MANIFESTIMAGE}:arm64v8-${EXT_RELEASE_TAG}
-                    if [ -n "${SEMVER}" ]; then
-                      docker tag ${MANIFESTIMAGE}:amd64-${META_TAG} ${MANIFESTIMAGE}:amd64-${SEMVER}
-                      docker tag ${MANIFESTIMAGE}:arm64v8-${META_TAG} ${MANIFESTIMAGE}:arm64v8-${SEMVER}
-                    fi
-                    docker push ${MANIFESTIMAGE}:amd64-${META_TAG}
-                    docker push ${MANIFESTIMAGE}:amd64-${EXT_RELEASE_TAG}
-                    docker push ${MANIFESTIMAGE}:amd64-latest
-                    docker push ${MANIFESTIMAGE}:arm64v8-${META_TAG}
-                    docker push ${MANIFESTIMAGE}:arm64v8-latest
-                    docker push ${MANIFESTIMAGE}:arm64v8-${EXT_RELEASE_TAG}
-                    if [ -n "${SEMVER}" ]; then
-                      docker push ${MANIFESTIMAGE}:amd64-${SEMVER}
-                      docker push ${MANIFESTIMAGE}:arm64v8-${SEMVER}
-                    fi
-                  done
-                  for MANIFESTIMAGE in "${IMAGE}" "${GITLABIMAGE}" "${GITHUBIMAGE}" "${QUAYIMAGE}"; do
-                    docker buildx imagetools create -t ${MANIFESTIMAGE}:latest ${MANIFESTIMAGE}:amd64-latest ${MANIFESTIMAGE}:arm64v8-latest
-                    docker buildx imagetools create -t ${MANIFESTIMAGE}:${META_TAG} ${MANIFESTIMAGE}:amd64-${META_TAG} ${MANIFESTIMAGE}:arm64v8-${META_TAG}
-                    docker buildx imagetools create -t ${MANIFESTIMAGE}:${EXT_RELEASE_TAG} ${MANIFESTIMAGE}:amd64-${EXT_RELEASE_TAG} ${MANIFESTIMAGE}:arm64v8-${EXT_RELEASE_TAG}
-                    if [ -n "${SEMVER}" ]; then
-                      docker buildx imagetools create -t ${MANIFESTIMAGE}:${SEMVER} ${MANIFESTIMAGE}:amd64-${SEMVER} ${MANIFESTIMAGE}:arm64v8-${SEMVER}
-                    fi
-                  done
-               '''
-          }
+                done
+                for MANIFESTIMAGE in "${IMAGE}" "${GITLABIMAGE}" "${GITHUBIMAGE}" "${QUAYIMAGE}"; do
+                  docker buildx imagetools create -t ${MANIFESTIMAGE}:latest ${MANIFESTIMAGE}:amd64-latest ${MANIFESTIMAGE}:arm64v8-latest || \
+                    { if [[ "${MANIFESTIMAGE}" != "${QUAYIMAGE}" ]]; then exit 1; fi; }
+                  docker buildx imagetools create -t ${MANIFESTIMAGE}:${META_TAG} ${MANIFESTIMAGE}:amd64-${META_TAG} ${MANIFESTIMAGE}:arm64v8-${META_TAG} || \
+                    { if [[ "${MANIFESTIMAGE}" != "${QUAYIMAGE}" ]]; then exit 1; fi; }
+                  docker buildx imagetools create -t ${MANIFESTIMAGE}:${EXT_RELEASE_TAG} ${MANIFESTIMAGE}:amd64-${EXT_RELEASE_TAG} ${MANIFESTIMAGE}:arm64v8-${EXT_RELEASE_TAG} || \
+                    { if [[ "${MANIFESTIMAGE}" != "${QUAYIMAGE}" ]]; then exit 1; fi; }
+                  if [ -n "${SEMVER}" ]; then
+                    docker buildx imagetools create -t ${MANIFESTIMAGE}:${SEMVER} ${MANIFESTIMAGE}:amd64-${SEMVER} ${MANIFESTIMAGE}:arm64v8-${SEMVER} || \
+                      { if [[ "${MANIFESTIMAGE}" != "${QUAYIMAGE}" ]]; then exit 1; fi; }
+                  fi
+                done
+              '''
         }
       }
     }
@@ -875,23 +1005,41 @@ pipeline {
         environment name: 'EXIT_STATUS', value: ''
       }
       steps {
-        echo "Pushing New tag for current commit ${META_TAG}"
-        sh '''curl -H "Authorization: token ${GITHUB_TOKEN}" -X POST https://api.github.com/repos/${LS_USER}/${LS_REPO}/git/tags \
-        -d '{"tag":"'${META_TAG}'",\
-             "object": "'${COMMIT_SHA}'",\
-             "message": "Tagging Release '${EXT_RELEASE_CLEAN}'-ls'${LS_TAG_NUMBER}' to master",\
-             "type": "commit",\
-             "tagger": {"name": "LinuxServer-CI","email": "ci@linuxserver.io","date": "'${GITHUB_DATE}'"}}' '''
-        echo "Pushing New release for Tag"
         sh '''#! /bin/bash
+              echo "Auto-generating release notes"
+              if [ "$(git tag --points-at HEAD)" != "" ]; then
+                echo "Existing tag points to current commit, suggesting no new LS changes"
+                AUTO_RELEASE_NOTES="No changes"
+              else
+                AUTO_RELEASE_NOTES=$(curl -fsL -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -X POST https://api.github.com/repos/${LS_USER}/${LS_REPO}/releases/generate-notes  \
+                  -d '{"tag_name":"'${META_TAG}'",\
+                      "target_commitish": "master"}' \
+                  | jq -r '.body' | sed 's|## What.s Changed||')
+              fi
+              echo "Pushing New tag for current commit ${META_TAG}"
+              curl -H "Authorization: token ${GITHUB_TOKEN}" -X POST https://api.github.com/repos/${LS_USER}/${LS_REPO}/git/tags \
+                -d '{"tag":"'${META_TAG}'",\
+                  "object": "'${COMMIT_SHA}'",\
+                  "message": "Tagging Release '${EXT_RELEASE_CLEAN}'-ls'${LS_TAG_NUMBER}' to master",\
+                  "type": "commit",\
+                  "tagger": {"name": "LinuxServer-CI","email": "ci@linuxserver.io","date": "'${GITHUB_DATE}'"}}'
+              echo "Pushing New release for Tag"
               echo "Updating external repo packages to ${EXT_RELEASE_CLEAN}" > releasebody.json
-              echo '{"tag_name":"'${META_TAG}'",\
-                     "target_commitish": "master",\
-                     "name": "'${META_TAG}'",\
-                     "body": "**LinuxServer Changes:**\\n\\n'${LS_RELEASE_NOTES}'\\n\\n**Repo Changes:**\\n\\n' > start
-              printf '","draft": false,"prerelease": false}' >> releasebody.json
-              paste -d'\\0' start releasebody.json > releasebody.json.done
-              curl -H "Authorization: token ${GITHUB_TOKEN}" -X POST https://api.github.com/repos/${LS_USER}/${LS_REPO}/releases -d @releasebody.json.done'''
+              jq -n \
+                --arg tag_name "$META_TAG" \
+                --arg target_commitish "master" \
+                --arg ci_url "${CI_URL:-N/A}" \
+                --arg ls_notes "$AUTO_RELEASE_NOTES" \
+                --arg remote_notes "$(cat releasebody.json)" \
+                '{
+                  "tag_name": $tag_name,
+                  "target_commitish": $target_commitish,
+                  "name": $tag_name,
+                  "body": ("**CI Report:**\\n\\n" + $ci_url + "\\n\\n**LinuxServer Changes:**\\n\\n" + $ls_notes + "\\n\\n**Remote Changes:**\\n\\n" + $remote_notes),
+                  "draft": false,
+                  "prerelease": false                }' > releasebody.json.done
+              curl -H "Authorization: token ${GITHUB_TOKEN}" -X POST https://api.github.com/repos/${LS_USER}/${LS_REPO}/releases -d @releasebody.json.done
+        '''
       }
     }
     // Add protection to the release branch
@@ -1066,12 +1214,22 @@ EOF
     }
     cleanup {
       sh '''#! /bin/bash
-            echo "Performing docker system prune!!"
-            containers=$(docker ps -aq)
+            echo "Pruning builder!!"
+            docker builder prune -f --builder container || :
+            containers=$(docker ps -q)
             if [[ -n "${containers}" ]]; then
-              docker stop ${containers}
+              BUILDX_CONTAINER_ID=$(docker ps -qf 'name=buildx_buildkit')
+              for container in ${containers}; do
+                if [[ "${container}" == "${BUILDX_CONTAINER_ID}" ]]; then
+                  echo "skipping buildx container in docker stop"
+                else
+                  echo "Stopping container ${container}"
+                  docker stop ${container}
+                fi
+              done
             fi
-            docker system prune -af --volumes || :
+            docker system prune -f --volumes || :
+            docker image prune -af || :
          '''
       cleanWs()
     }
