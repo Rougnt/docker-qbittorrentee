@@ -1,0 +1,16 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+
+# Ensure log directory exists
+mkdir -p /config/qBittorrent/logs
+
+# Ensure log file exists so tail doesn't complain initially
+touch /config/qBittorrent/logs/qbittorrent.log
+
+if [[ -z ${LSIO_NON_ROOT_USER} ]]; then
+    # Ensure abc user can read it
+    chown abc:abc /config/qBittorrent/logs/qbittorrent.log
+    exec s6-setuidgid abc tail -F /config/qBittorrent/logs/qbittorrent.log
+else
+    exec tail -F /config/qBittorrent/logs/qbittorrent.log
+fi
