@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-FROM ghcr.io/linuxserver/unrar:latest AS unrar
-FROM lsiobase/alpine:3.20 AS builder
+FROM ghcr.nju.edu.cn/linuxserver/unrar:latest AS unrar
+FROM ghcr.nju.edu.cn/linuxserver/baseimage-alpine:3.23 AS builder
 
 LABEL maintainer="Rogunt"
 
@@ -16,7 +16,7 @@ RUN cd /qbittorrent \
 	&& bash install.sh
   
 
-FROM ghcr.io/linuxserver/baseimage-alpine:edge
+FROM ghcr.nju.edu.cn/linuxserver/baseimage-alpine:edge
 
 # set version label
 ARG BUILD_DATE
