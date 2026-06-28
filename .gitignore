@@ -49,3 +49,14 @@ Temporary Items
 
 # files that testing
 qb
+
+# Useless upstream files
+Jenkinsfile
+jenkins-vars.yml
+.github/workflows/call_issue_pr_tracker.yml
+.github/workflows/call_issues_cron.yml
+.github/workflows/external_trigger_scheduler.yml
+.github/workflows/external_trigger.yml
+.github/workflows/greetings.yml
+.github/workflows/package_trigger_scheduler.yml
+.github/workflows/permissions.yml

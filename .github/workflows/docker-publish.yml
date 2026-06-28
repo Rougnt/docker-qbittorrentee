@@ -7,7 +7,7 @@ on:
     branches: [ "master" ]
   workflow_dispatch:
   schedule:
-    - cron: '0 9 * * 1'
+    - cron: '0 0 * * *' # 每天凌晨 0 点自动运行，检测上游是否有新 release
   
 
 # 项目任务，任务之间可以并行调度
@@ -37,8 +37,25 @@ jobs:
       run: |
         app_version=$(curl -sL "https://api.github.com/repos/c0re100/qBittorrent-Enhanced-Edition/releases/latest" | jq -r '. | .tag_name ' | sed 's/^release-//')
         echo "app_version=$app_version" >> $GITHUB_ENV
+        echo "app_version=$app_version" >> $GITHUB_OUTPUT
+    # 检查 Docker Hub 上是否已存在该版本标签，若存在则跳过构建
+    - name: Check if image tag already exists
+      id: check_tag
+      run: |
+        USERNAME="${{ secrets.DOCKER_USERNAME }}"
+        if [ -z "$USERNAME" ]; then
+          USERNAME="rogunt"
+        fi
+        if curl -sfL "https://registry.hub.docker.com/v2/repositories/${USERNAME}/qbittorrentee/tags/${{ steps.release_version.outputs.app_version }}" > /dev/null 2>&1; then
+          echo "Tag ${{ steps.release_version.outputs.app_version }} already exists on Docker Hub. Skipping build."
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "Tag ${{ steps.release_version.outputs.app_version }} does not exist. Proceeding with build."
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
     # 开始构建镜像
     - name: Build and push
+      if: steps.check_tag.outputs.exists != 'true'
       uses: docker/build-push-action@v2
       with:
         context: .
@@ -54,6 +71,7 @@ jobs:
           ${{ secrets.DOCKER_USERNAME }}/qbittorrentee:${{ env.app_version }}
     # 这里是通过md文件自动生成dockerhub描述的模块，也可以不需要
     - name: Docker Hub Description
+      if: steps.check_tag.outputs.exists != 'true' && secrets.DOCKER_USERNAME != ''
       uses: peter-evans/dockerhub-description@v4
       with:
         username: ${{ secrets.DOCKER_USERNAME }}

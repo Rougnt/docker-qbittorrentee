@@ -15,3 +15,14 @@
 *.PDF	 diff=astextplain
 *.rtf	 diff=astextplain
 *.RTF	 diff=astextplain
+
+# Shield upstream files from merges (keeps them deleted/ignored)
+Jenkinsfile merge=ours
+jenkins-vars.yml merge=ours
+.github/workflows/call_issue_pr_tracker.yml merge=ours
+.github/workflows/call_issues_cron.yml merge=ours
+.github/workflows/external_trigger_scheduler.yml merge=ours
+.github/workflows/external_trigger.yml merge=ours
+.github/workflows/greetings.yml merge=ours
+.github/workflows/package_trigger_scheduler.yml merge=ours
+.github/workflows/permissions.yml merge=ours
