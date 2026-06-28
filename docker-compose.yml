@@ -2,7 +2,7 @@ services:
   qbittorrent:
     build: 
       context: .
-      dockerfile: DockerfileEE
+      dockerfile: Dockerfile
     image: rogunt/qbittorrentee:latest
     container_name: qbittorrent
     environment:
