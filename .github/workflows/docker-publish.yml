@@ -15,6 +15,8 @@ jobs:
   build:
   # 选择云端运行的环境
     runs-on: ubuntu-latest
+    env:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
     steps:
     # uses代表使用一个模块，此处使用的是checkout模块，将github项目文件导入到当前环境中
     - uses: actions/checkout@v3
@@ -71,7 +73,7 @@ jobs:
           ${{ secrets.DOCKER_USERNAME }}/qbittorrentee:${{ env.app_version }}
     # 这里是通过md文件自动生成dockerhub描述的模块，也可以不需要
     - name: Docker Hub Description
-      if: steps.check_tag.outputs.exists != 'true' && secrets.DOCKER_USERNAME != ''
+      if: steps.check_tag.outputs.exists != 'true' && env.DOCKER_USERNAME != ''
       uses: peter-evans/dockerhub-description@v4
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
